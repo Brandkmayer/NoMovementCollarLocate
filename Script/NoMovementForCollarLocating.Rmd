@@ -1,0 +1,175 @@
+---
+title: "NoMovementCleaningAndCollarLocator"
+author: "Brandon Mayer"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(maps)
+library(mapdata)
+library(ggplot2)
+library(geosphere)
+library(tidyverse)
+library(slider)
+library(sf)
+library(sfheaders)
+```
+Need RAW API data and associated collar list. 
+
+If looking for the centered location of a dropped collar start small. Find collars that are still reporting and pull a month or so of data.  
+
+Data Pre-wrangle
+```{r}
+# # Selecting raw data from the Vence_api data folder
+# wd <- paste0(dirname(path.expand('~')),"/PycharmProjects/Vence-API/data");(files<-file.info(list.files(wd,full.names = T))%>% arrange(desc(mtime)))
+
+(files<-file.info(list.files(paste0(getwd(),"/data/Vence-API_Data"),full.names = T))%>% arrange(desc(mtime)))
+sampdata <- read.csv(row.names(files)[1]) 
+sampdata <-sampdata[
+  order( sampdata[,4], sampdata[,3] ),
+] %>% select(-index,-uuid);sampdata$date<- lubridate::ymd_hms(sampdata$date)
+sampdata <- sampdata[!is.na(sampdata$date),]
+# Selecting collar list to filter data from the api pull
+(Metafiles <-file.info(list.files(paste0(getwd(),"/data/CollarLists"),full.names = T))%>% arrange(desc(mtime)))
+
+
+# Meta<- read_csv(Metafiles[12]) %>% select("collar" = DeviceEUI,EarTag,HerdName)
+Meta<- read_csv(row.names(Metafiles)[1]) %>% select("collar" = DeviceEUI,EarTag,HerdName) #%>% mutate(HerdName = "Small Herd") 
+# Meta <- read.csv(paste(dirname(path.expand('~')),"/Box/1.Ruyle_lab/1.Project_Data/Virtual Fencing/GPSData/ArcGIS/Pasture8_Pilot2022/Pasture8_2022collars.csv", sep=""))%>% select("collar" = DeviceEUI,EarTag,HerdName)
+
+NMC_uncleaned <- sampdata %>% left_join(Meta, by = "collar") %>% drop_na(HerdName)
+NMC_uncleaned <- NMC_uncleaned%>% filter(grepl('GpsLocationExtIndication', messagetype))
+NMC_uncleaned <- NMC_uncleaned %>% group_by(collar)%>% arrange(collar,date) %>% ungroup()
+NMC_uncleaned <- NMC_uncleaned %>% mutate(longitude = as.numeric(longitude),latitude = as.numeric(latitude) )
+NMC_uncleaned <- NMC_uncleaned[!is.na(NMC_uncleaned$latitude),]
+
+# Should have no "NAs" in the EarTag column assuming all collars of interest were joined correctly
+# If Eartags/individual identifiers are not important ignore and continue on
+#NMC_uncleaned[is.na(NMC_uncleaned$EarTag),]
+
+```
+
+Step 1:Removing Distance Errors
+  -   Add Distance for each collar group, rbind, mutate the time between gps points, assess the rate of movement as DistTime (m/min)
+```{r}
+NMC_listed <- split(NMC_uncleaned,NMC_uncleaned$collar)
+for (i in 1:length(NMC_listed)) {
+  NMC_listed[[i]]$Dist <- c(NA)
+  for (j in 1:(nrow(NMC_listed[[i]])-1)) {
+    NMC_listed[[i]]$Dist[j+1]<- distm(c(NMC_listed[[1]][1,5][[1]],
+                                      NMC_listed[[i]][j,4][[1]]),
+                                    c(NMC_listed[[i]][(j+1),5][[1]],
+                                      NMC_listed[[i]][(j+1),4][[1]]),
+                                    fun = distHaversine)
+    }
+}
+NMC_uncleaned <- data.table::rbindlist(NMC_listed)
+
+# Add a rate of movement
+NMC_uncleaned <- NMC_uncleaned %>% group_by(collar)%>% arrange(collar,date) %>%
+  mutate(time_diff = difftime(date,lag(date), units='mins'))
+
+NMC_uncleaned <- NMC_uncleaned %>% group_by(collar) %>% mutate(DistTime=Dist/as.numeric(time_diff))
+NMC_uncleaned <-NMC_uncleaned[!NMC_uncleaned$DistTime >=84,] # 84 m/min: movement speed of a cow
+NMC_listed <- split(NMC_uncleaned,NMC_uncleaned$collar)
+for (i in 1:length(NMC_listed)) {
+  NMC_listed[[i]]$Dist <- c(NA)
+  for (j in 1:(nrow(NMC_listed[[i]])-1)) {
+    NMC_listed[[i]]$Dist[j+1]<- distm(c(NMC_listed[[i]][j,5][[1]],
+                                      NMC_listed[[i]][j,4][[1]]),
+                                    c(NMC_listed[[i]][(j+1),5][[1]],
+                                      NMC_listed[[i]][(j+1),4][[1]]),
+                                    fun = distHaversine)
+    }
+}
+NMC_uncleaned <- data.table::rbindlist(NMC_listed)
+```
+
+Step 2:  rowSum collars within a known area
+```{r}
+# Function for counting point within an area
+count_return <- function(long, lat, dist) {
+  clonglat <- cbind(long,lat)
+count <- rowSums(distm(clonglat[1,],clonglat, 
+       fun = distHaversine)<= dist) # Average max quantile distance for 8 collars in varying canopy densities was 34m
+return(count)
+ }
+
+# Identify 10 consecutive points with total median counts exceeding 27
+DC_screen <- function(Median) {
+count <- ifelse(sum(Median >= 27)>=10,1,0)
+return(count)
+}
+
+test <-NMC_uncleaned %>% group_by(collar) %>% mutate(ErrorGPS = slide2_dbl(.x = longitude,.y = latitude, ~count_return(.x,.y,34),.after =36))
+
+# Smooth counts to adjust for minor GPS errors
+# NMC_NMcleaned <- test %>% group_by(collar) %>% mutate(Median = slide_dbl(ErrorGPS,~median(.x),.before=5, .after = 5))
+
+NMC_NMcleaned <- test %>% group_by(collar) %>% mutate(DCScreen = slide_dbl(ErrorGPS,~DC_screen(.x), .after = 10))
+
+# Identify the first occasion of the above requirements 
+NMC_NMcleaned<- NMC_NMcleaned %>% group_by(collar,DCScreen) %>% mutate(Start = row_number()==1) 
+
+# Differentiate first cases between when the collar was active and when it dropped
+NMC_NMcleaned <-NMC_NMcleaned %>% group_by(collar)%>% mutate(Final=case_when(Start & DCScreen==0~0,
+                                                             Start & DCScreen==1~1)) 
+# fill down from the start points( 0 active collar, 1 dropped collar)
+NMC_NMcleaned <-NMC_NMcleaned %>% group_by(collar) %>% fill(Final,.direction = "down")
+
+# Check collars to make sure the final matches up with the change in gps error 
+for (i in 1:length(unique(NMC_NMcleaned$collar))) {
+  x <- unique(NMC_NMcleaned$collar)
+  j<- (ggplot(NMC_NMcleaned%>%filter(collar==x[i]), aes(x=date)) +
+  geom_line(aes(y=Final),color="red")+
+  geom_line(aes(y=ErrorGPS),color="black"))+ labs(title = x[i])
+  print(j)
+}
+
+NMC_NMcleaned
+```
+At this point, the row associated with the collar dropping has been marked. The user can either remove collars from analysis or subset rows after the collar dropped from the main dataframe. 
+
+```{r}
+# writes a shapefile of the clustered gps center point
+# May need to  adjust epsg
+NoMovement <- NMC_NMcleaned[NMC_NMcleaned$Final ==1,]
+NoMovementCenter <- NoMovement %>% group_by(collar)%>% summarise(longitude=mean(longitude), latitude=mean(latitude))
+st_write(st_as_sf(NoMovementCenter, coords = c("longitude", "latitude"), crs = 4326),paste0(getwd(),"/Product/",unique(NoMovement$HerdName),"_",date(min(NoMovement$date)),"_",date(max(NoMovement$date)),"_MissingCollars.shp"))
+
+
+```
+When selecting for collars that are known "No movements"
+"Final" is ignored in this case and rows that have at least 33 points within them are used in locating a center point. \
+
+Plots the variation in GPS counts (ErrorGPS), associated point cloud, and centered point
+
+Ports out a shapefile each collar. 
+
+** there is a possibility that, if you pull too much data, you can have two point clouds depending on if you recollared between the collar dropping. 
+ --- remove those collars a reduce the window you are pulling from.
+
+```{r}
+#Select for points that are within the gps error range
+NoMovementScreen <- NMC_NMcleaned[NMC_NMcleaned$ErrorGPS >32,]
+
+for (i in 1:length(unique(NoMovementScreen$collar))) {
+  x <- unique(NoMovementScreen$collar)
+  df <- NoMovementScreen%>%filter(collar==x[i])
+  j<- (ggplot(df, aes(x=date)) +
+  geom_line(aes(y=ErrorGPS),color="black"))+ labs(title = x[i])
+  m<- ggplot(df, aes(x = longitude, y = latitude)) +
+  geom_point() +
+  geom_point(data = df, aes(x = mean(longitude),y = mean(latitude)),color ="red")+
+  coord_map(xlim = c(min(df$longitude), max(df$longitude)),ylim = c(min(df$latitude), max(df$latitude))) + #limits added as there are some points really far away
+  theme_classic()+ labs(title = x[i])
+  print(j);print(m)
+}
+
+NoMovementScreeningCenter <- NoMovementScreen %>% group_by(collar)%>% summarise(longitude=mean(longitude), latitude=mean(latitude))
+st_write(st_as_sf(NoMovementScreeningCenter, coords = c("longitude", "latitude"), crs = 4326),paste0(getwd(),"/Product/","NoMovement","_",date(min(NoMovementScreen$date)),"_",date(max(NoMovementScreen$date)),"_MissingCollars.shp"))
+```
+
+

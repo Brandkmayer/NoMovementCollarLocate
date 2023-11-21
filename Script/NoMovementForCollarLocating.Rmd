@@ -15,6 +15,18 @@ library(tidyverse)
 library(slider)
 library(sf)
 library(sfheaders)
+# Function for counting point within an area
+count_return <- function(long, lat, dist) {
+  clonglat <- cbind(long,lat)
+count <- rowSums(distm(clonglat[1,],clonglat, 
+       fun = distHaversine)<= dist) # Average max quantile distance for 8 collars in varying canopy densities was 34m
+return(count)
+ }
+# Identify 10 consecutive points with total median counts exceeding 27
+DC_screen <- function(Median) {
+count <- ifelse(sum(Median >= 27)>=10,1,0)
+return(count)
+}
 ```
 Need RAW API data and associated collar list. 
 
@@ -36,7 +48,7 @@ sampdata <- sampdata[!is.na(sampdata$date),]
 
 
 # Meta<- read_csv(Metafiles[12]) %>% select("collar" = DeviceEUI,EarTag,HerdName)
-Meta<- read_csv(row.names(Metafiles)[1]) %>% select("collar" = DeviceEUI,EarTag,HerdName) #%>% mutate(HerdName = "Small Herd") 
+Meta<- read_csv(row.names(Metafiles)[2]) %>% select("collar" = DeviceEUI,EarTag,HerdName) #%>% mutate(HerdName = "Small Herd") 
 # Meta <- read.csv(paste(dirname(path.expand('~')),"/Box/1.Ruyle_lab/1.Project_Data/Virtual Fencing/GPSData/ArcGIS/Pasture8_Pilot2022/Pasture8_2022collars.csv", sep=""))%>% select("collar" = DeviceEUI,EarTag,HerdName)
 
 NMC_uncleaned <- sampdata %>% left_join(Meta, by = "collar") %>% drop_na(HerdName)
@@ -55,10 +67,11 @@ Step 1:Removing Distance Errors
   -   Add Distance for each collar group, rbind, mutate the time between gps points, assess the rate of movement as DistTime (m/min)
 ```{r}
 NMC_listed <- split(NMC_uncleaned,NMC_uncleaned$collar)
+if (length(Filter(function(x) any(nrow(x) < 2),NMC_listed))>0) {print(paste0("Collar ",names(Filter(function(x) any(nrow(x) < 2),NMC_listed))[[1]]," only has one point and cant be found"));NMC_listed <- Filter(function(x) any(nrow(x) > 1),NMC_listed)}
 for (i in 1:length(NMC_listed)) {
   NMC_listed[[i]]$Dist <- c(NA)
   for (j in 1:(nrow(NMC_listed[[i]])-1)) {
-    NMC_listed[[i]]$Dist[j+1]<- distm(c(NMC_listed[[1]][1,5][[1]],
+    NMC_listed[[i]]$Dist[j+1]<- distm(c(NMC_listed[[i]][j,5][[1]],
                                       NMC_listed[[i]][j,4][[1]]),
                                     c(NMC_listed[[i]][(j+1),5][[1]],
                                       NMC_listed[[i]][(j+1),4][[1]]),
@@ -89,19 +102,6 @@ NMC_uncleaned <- data.table::rbindlist(NMC_listed)
 
 Step 2:  rowSum collars within a known area
 ```{r}
-# Function for counting point within an area
-count_return <- function(long, lat, dist) {
-  clonglat <- cbind(long,lat)
-count <- rowSums(distm(clonglat[1,],clonglat, 
-       fun = distHaversine)<= dist) # Average max quantile distance for 8 collars in varying canopy densities was 34m
-return(count)
- }
-
-# Identify 10 consecutive points with total median counts exceeding 27
-DC_screen <- function(Median) {
-count <- ifelse(sum(Median >= 27)>=10,1,0)
-return(count)
-}
 
 test <-NMC_uncleaned %>% group_by(collar) %>% mutate(ErrorGPS = slide2_dbl(.x = longitude,.y = latitude, ~count_return(.x,.y,34),.after =36))
 
@@ -152,8 +152,18 @@ Ports out a shapefile each collar.
  --- remove those collars a reduce the window you are pulling from.
 
 ```{r}
+"00007cf2dd1fe8ff"
 #Select for points that are within the gps error range
-NoMovementScreen <- NMC_NMcleaned[NMC_NMcleaned$ErrorGPS >32,]
+NoMovementScreen <- NMC_NMcleaned[NMC_NMcleaned$ErrorGPS >32,] %>% group_by(collar) %>% mutate(ErrorGPS2 = slide2_dbl(.x = longitude,.y = latitude, ~count_return(.x,.y,34),.after =36)) %>% dplyr::group_by(collar, ErrorGPS2) %>%
+    # add row number which works per group due to prior grouping
+    dplyr::mutate(duplicateID = dplyr::row_number()) %>%
+    # ungroup to prevent unexpected behaviour down stream
+    dplyr::group_by(collar)%>% mutate(DropGroup = case_when(ErrorGPS2==1&duplicateID ==1~1,
+                                                             ErrorGPS2==1&duplicateID ==2~2,
+                                                             ErrorGPS2==1&duplicateID ==3~3,
+                                                             T ~ NA)) %>% fill(DropGroup,.direction = "up") %>% group_by(collar,DropGroup)%>%
+  filter(n() > 2) %>% group_by(collar) %>% filter(DropGroup ==max(DropGroup))
+
 
 for (i in 1:length(unique(NoMovementScreen$collar))) {
   x <- unique(NoMovementScreen$collar)
@@ -168,8 +178,14 @@ for (i in 1:length(unique(NoMovementScreen$collar))) {
   print(j);print(m)
 }
 
+
+```
+
+
+```{r}
 NoMovementScreeningCenter <- NoMovementScreen %>% group_by(collar)%>% summarise(longitude=mean(longitude), latitude=mean(latitude))
 st_write(st_as_sf(NoMovementScreeningCenter, coords = c("longitude", "latitude"), crs = 4326),paste0(getwd(),"/Product/","NoMovement","_",date(min(NoMovementScreen$date)),"_",date(max(NoMovementScreen$date)),"_MissingCollars.shp"))
 ```
+
 
 

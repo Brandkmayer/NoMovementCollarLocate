@@ -152,7 +152,6 @@ Ports out a shapefile each collar.
  --- remove those collars a reduce the window you are pulling from.
 
 ```{r}
-"00007cf2dd1fe8ff"
 #Select for points that are within the gps error range
 NoMovementScreen <- NMC_NMcleaned[NMC_NMcleaned$ErrorGPS >32,] %>% group_by(collar) %>% mutate(ErrorGPS2 = slide2_dbl(.x = longitude,.y = latitude, ~count_return(.x,.y,34),.after =36)) %>% dplyr::group_by(collar, ErrorGPS2) %>%
     # add row number which works per group due to prior grouping
